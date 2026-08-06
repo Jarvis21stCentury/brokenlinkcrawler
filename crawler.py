@@ -1,87 +1,89 @@
 import asyncio
 import httpx
-from fetch_page import fetch_page, extract_links, is_internal_url
+from fetch_page import fetch_page, extract_links, is_internal_url, normalize_url
 from check_link import check_link
 from queries import save_page, save_link, bump_pages_crawled, set_pages_queued
 from models import PageRecord, LinkResult, QueueItem
 from constants import link_check_concurrency
 
-class CrawlStats:
-    def __init__(self):
-        self.pages_crawled = 0
-        self.links_checked = 0
-        self.links_broken = 0
 
-    def record_page(self):
-        self.pages_crawled += 1
-
-    def record_link(self, result):
-        self.links_checked += 1
-        if result.status == "broken":
-            self.links_broken += 1
-
-async def run_crawl(job):
-    seen = {job.root_url}
-    queue = [QueueItem(job.root_url, 0)]
-    stats = CrawlStats()
-
+async def run_crawl(job, should_stop=None):
     async with httpx.AsyncClient() as client:
-        while queue and stats.pages_crawled < job.max_pages:
-            queue = await process_level(client, job, queue, seen, stats)
+        await Crawl(client, job, should_stop).run()
 
-async def process_level(client, job, level, seen, stats):
-    next_queue = []
-    set_pages_queued(job.id, len(level))
 
-    for item in level:
-        if stats.pages_crawled >= job.max_pages:
-            break
-        if item.depth > job.max_depth:
-            continue
-        await process_single_page(client, job, item, seen, stats, next_queue)
+class Crawl:
+    """Walks one site breadth-first, a whole depth level at a time."""
 
-    return next_queue
+    def __init__(self, client, job, should_stop=None):
+        self.client = client
+        self.job = job
+        self.should_stop = should_stop or (lambda: False)
+        self.sem = asyncio.Semaphore(link_check_concurrency)
+        self.root = normalize_url(job.root_url)
+        self.seen = {self.root}
+        # one result per target url, so a nav link sitting on every page
+        # gets requested once instead of once per page it shows up on
+        self.checked = {}
+        self.crawled = 0
 
-async def process_single_page(client, job, item, seen, stats, next_queue):
-    page = await fetch_page(client, item.url)
-    save_page(PageRecord(job.id, item.url, item.depth, page.status_code))
-    stats.record_page()
-    bump_pages_crawled(job.id)
-    if page.html is None:
-        return
+    async def run(self):
+        level = [QueueItem(self.root, 0)]
+        try:
+            while level and self.crawled < self.job.max_pages and not self.should_stop():
+                set_pages_queued(self.job.id, len(level))
+                level = await self.crawl_level(level)
+        finally:
+            set_pages_queued(self.job.id, 0)
 
-    links_on_page = extract_links(page.html, item.url)
-    can_go_deeper = (item.depth + 1) <= job.max_depth
-    await check_all_links(client, job, item, links_on_page, seen, can_go_deeper, next_queue, stats)
+    async def crawl_level(self, level):
+        next_level = []
+        for item in level:
+            if self.crawled >= self.job.max_pages or self.should_stop():
+                break
+            next_level.extend(await self.crawl_page(item))
+            self.crawled += 1
+        return next_level
 
-async def check_all_links(client, job, item, links, seen, can_go_deeper, next_queue, stats):
-    sem = asyncio.Semaphore(link_check_concurrency)
-    tasks = []
+    async def crawl_page(self, item):
+        page = await fetch_page(self.client, item.url)
+        save_page(PageRecord(self.job.id, item.url, item.depth, page.status_code))
+        bump_pages_crawled(self.job.id)
+        if page.html is None:
+            return []
 
-    for link in links:
-        task = handle_one_link(client, sem, job, item, link, seen, can_go_deeper, next_queue, stats)
-        tasks.append(task)
+        found = await asyncio.gather(*[
+            self.check_and_queue(item, link)
+            for link in extract_links(page.html, item.url)
+        ])
+        return [queued for queued in found if queued is not None]
 
-    if tasks:
-        await asyncio.gather(*tasks)
+    async def check_and_queue(self, item, link):
+        result = self.checked.get(link)
+        if result is None:
+            async with self.sem:
+                result = await check_link(self.client, link)
+            self.checked[link] = result
 
-async def handle_one_link(client, sem, job, item, link, seen, can_go_deeper, next_queue, stats):
-    async with sem:
-        internal = is_internal_url(link, job.root_url)
-        result = await check_link(client, link)
-        stats.record_link(result)
         save_link(LinkResult(
-            job_id = job.id,
-            source_page = item.url,
-            target_url = link,
-            is_internal = internal,
-            status_code = result.status_code,
-            status = result.status,
-            redirect_chain = result.redirect_chain,
-            error_message = result.error_message,
+            job_id=self.job.id,
+            source_page=item.url,
+            target_url=link,
+            is_internal=is_internal_url(link, self.job.root_url),
+            status_code=result.status_code,
+            status=result.status,
+            redirect_chain=result.redirect_chain,
+            error_message=result.error_message,
         ))
 
-        should_follow = internal and result.status != "broken" and link not in seen and can_go_deeper
-        if should_follow:
-            seen.add(link)
-            next_queue.append(QueueItem(link, item.depth + 1))
+        if item.depth >= self.job.max_depth or result.status not in ("ok", "redirect"):
+            return None
+
+        # queue where the link actually landed, so a redirect and its
+        # destination don't both get crawled as separate pages
+        target = normalize_url(result.final_url or link)
+        if not is_internal_url(target, self.job.root_url) or target in self.seen:
+            return None
+
+        self.seen.add(target)
+        return QueueItem(target, item.depth + 1)

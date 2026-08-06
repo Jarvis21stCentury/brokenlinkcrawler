@@ -1,10 +1,9 @@
 from dataclasses import dataclass, field
-from typing import Optional
 import time
 
 
 @dataclass
-class crawljob:
+class CrawlJob:
     id: str
     root_url: str
     status: str
@@ -13,17 +12,11 @@ class crawljob:
     pages_queued: int = 0
     pages_crawled: int = 0
     created_at: float = field(default_factory=time.time)
-    finished_at: Optional[float] = None
-    error: Optional[str] = None
+    finished_at: float | None = None
+    error: str | None = None
 
     def is_finished(self):
         return self.status in ("done", "failed")
-
-    def percent_complete(self):
-        if self.max_pages == 0:
-            return 0
-        raw = (self.pages_crawled / self.max_pages) * 100
-        return min(100, round(raw, 1))
 
 
 @dataclass
@@ -31,7 +24,7 @@ class PageRecord:
     job_id: str
     url: str
     depth: int
-    status_code: Optional[int]
+    status_code: int | None
     crawled_at: float = field(default_factory=time.time)
 
 
@@ -41,14 +34,11 @@ class LinkResult:
     source_page: str
     target_url: str
     is_internal: bool
-    status_code: Optional[int]
+    status_code: int | None
     status: str
     redirect_chain: list
-    error_message: Optional[str]
+    error_message: str | None
     checked_at: float = field(default_factory=time.time)
-
-    def is_ok(self):
-        return self.status == "ok"
 
 
 @dataclass

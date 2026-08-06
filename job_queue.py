@@ -1,25 +1,33 @@
 import asyncio
-import traceback
-from queries import get_job, mark_job_in_progress, mark_job_finished
+import logging
+from queries import get_job, mark_job_running, mark_job_finished
 from crawler import run_crawl
+
+logger = logging.getLogger(__name__)
+
 
 class JobQueue:
     def __init__(self):
         self._queue = asyncio.Queue()
-        self._running_id = None
         self._worker_task = None
         self._cancelled_ids = set()
-        self._finished_count = 0
 
     def start(self):
         if self._worker_task is None:
             self._worker_task = asyncio.create_task(self._worker())
 
+    async def stop(self):
+        if self._worker_task is None:
+            return
+        self._worker_task.cancel()
+        try:
+            await self._worker_task
+        except asyncio.CancelledError:
+            pass
+        self._worker_task = None
+
     async def enqueue(self, job_id):
         await self._queue.put(job_id)
-
-    def is_running(self, job_id):
-        return self._running_id == job_id
 
     def cancel(self, job_id):
         self._cancelled_ids.add(job_id)
@@ -27,45 +35,39 @@ class JobQueue:
     def queue_size(self):
         return self._queue.qsize()
 
-    def has_pending(self):
-        return self._queue.qsize() > 0
-
-    def current_job_id(self):
-        return self._running_id
-
-    def finished_count(self):
-        return self._finished_count
-
     async def _worker(self):
         while True:
             job_id = await self._queue.get()
-            await self._process_job(job_id)
-            self._queue.task_done()
+            try:
+                await self._process_job(job_id)
+            except Exception:
+                # never let one bad job take the worker down with it
+                logger.exception("could not process job %s", job_id)
+            finally:
+                self._cancelled_ids.discard(job_id)
+                self._queue.task_done()
 
     async def _process_job(self, job_id):
-        if job_id in self._cancelled_ids:
-            self._cancelled_ids.remove(job_id)
-            return
-
         job = get_job(job_id)
         if job is None:
             return
 
-        self._running_id = job_id
-        mark_job_in_progress(job_id, "running", None)
+        if job_id in self._cancelled_ids:
+            mark_job_finished(job_id, "failed", "cancelled")
+            return
 
+        mark_job_running(job_id)
         try:
-            await run_crawl(job)
-            mark_job_finished(job_id, "done", None)
+            await run_crawl(job, should_stop=lambda: job_id in self._cancelled_ids)
         except Exception as e:
-            self._log_failure(job_id, e)
+            logger.exception("crawl job %s failed", job_id)
             mark_job_finished(job_id, "failed", str(e))
-        finally:
-            self._running_id = None
-            self._finished_count += 1
+            return
 
-    def _log_failure(self, job_id, err):
-        print("job", job_id, "blew up:")
-        traceback.print_exc()
+        if job_id in self._cancelled_ids:
+            mark_job_finished(job_id, "failed", "cancelled")
+        else:
+            mark_job_finished(job_id, "done", None)
+
 
 job_queue = JobQueue()
