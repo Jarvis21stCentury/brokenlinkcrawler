@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>Broken Link Crawler</title>
+        <style>
+            body {
+                font-family: -apple-system, sans-serif;
+                max-width: 700px;
+                margin: 60px auto;
+                padding: 0 20px;
+                color: #222;
+            }
+
+            h1 {
+                font-size: 24px;
+                margin-bottom: 4px;
+            }
+
+            .sub {
+                color: #888;
+                font-size: 14px;
+                margin-bottom: 24px;
+            }
+
+            form {
+                display: flex;
+                gap: 8px;
+                margin-bottom: 16px;
+            }
+
+            input {
+                flex: 1;
+                min-width: 0;
+                padding: 8px 12px;
+                border: 1px solid #ccc;
+                border-radius: 6px;
+            }
+
+            button {
+                padding: 8px 16px;
+                background: #111;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                cursor: pointer;
+            }
+
+            button:disabled {
+                opacity: 0.5;
+            }
+
+            .error {
+                color: #c0392b;
+                font-size: 14px;
+            }
+
+            .bar-wrap {
+                width: 100%;
+                height: 8px;
+                background: #eee;
+                border-radius: 4px;
+                overflow: hidden;
+                margin: 6px 0;
+            }
+
+            .bar {
+                height: 8px;
+                background: #111;
+                transition: width 0.3s;
+            }
+
+            .status-text {
+                font-size: 12px;
+                color: #999;
+            }
+
+            .report-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                gap: 12px;
+                margin-bottom: 12px;
+            }
+
+            .filter-select {
+                padding: 4px 8px;
+                border-radius: 6px;
+            }
+
+            .empty-state {
+                color: #2e7d32;
+            }
+
+            .broken-block {
+                border: 1px solid #eee;
+                border-radius: 8px;
+                padding: 12px;
+                margin-bottom: 12px;
+            }
+
+            .broken-source {
+                font-size: 12px;
+                color: #888;
+                margin-bottom: 8px;
+                overflow-wrap: anywhere;
+            }
+
+            .broken-list {
+                list-style: none;
+                padding: 0;
+                margin: 0;
+            }
+
+            .broken-item {
+                font-size: 14px;
+                display: flex;
+                align-items: baseline;
+                gap: 8px;
+                margin-bottom: 4px;
+            }
+
+            .status-code {
+                color: #c0392b;
+                font-family: monospace;
+                font-size: 12px;
+                flex: 0 0 56px;
+            }
+
+            .target-url {
+                flex: 1;
+                min-width: 0;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+
+            .external-tag {
+                flex: none;
+                font-size: 11px;
+                color: #999;
+            }
+        </style>
+    </head>
+    <body>
+        <h1>Broken Link Crawler</h1>
+        <p class="sub">paste a homepage url, I'll find what's broken on it</p>
+
+        <form id="crawl-form">
+            <input type="url" id="url-input" placeholder="https://example.com" required />
+            <button type="submit" id="submit-btn">crawl it</button>
+        </form>
+
+        <p class="error" id="form-error"></p>
+        <div id="progress"></div>
+        <div id="report"></div>
+
+        <script>
+            const form = document.getElementById("crawl-form");
+            const urlInput = document.getElementById("url-input");
+            const submitBtn = document.getElementById("submit-btn");
+            const formError = document.getElementById("form-error");
+            const progressEl = document.getElementById("progress");
+            const reportEl = document.getElementById("report");
+
+            // the api reports every count for the whole crawl, so each filter
+            // has to pick the one that matches what's actually on screen
+            const filters = [
+                {value: "all", label: "all broken", count: s => s.total_broken},
+                {value: "internal", label: "internal only", count: s => s.broken_internal_count},
+                {value: "external", label: "external only", count: s => s.broken_external_count}
+            ];
+
+            let jobId = null;
+            let pollTimer = null;
+
+            form.addEventListener("submit", async (e) => {
+                e.preventDefault();
+                formError.textContent = "";
+                reportEl.replaceChildren();
+                submitBtn.disabled = true;
+                submitBtn.textContent = "starting...";
+
+                try {
+                    jobId = await startCrawl(urlInput.value);
+                } catch (err) {
+                    formError.textContent = err.message;
+                    return;
+                } finally {
+                    submitBtn.disabled = false;
+                    submitBtn.textContent = "crawl it";
+                }
+
+                clearInterval(pollTimer);
+                poll();
+                pollTimer = setInterval(poll, 1200);
+            });
+
+            async function startCrawl(url) {
+                let res;
+                try {
+                    res = await fetch("/api/crawl", {
+                        method: "POST",
+                        headers: {"Content-Type": "application/json"},
+                        body: JSON.stringify({url})
+                    });
+                } catch (err) {
+                    throw new Error("couldn't reach the server");
+                }
+
+                const data = await res.json();
+                if (!res.ok) {
+                    throw new Error(data.detail || "something broke, try again");
+                }
+                return data.job_id;
+            }
+
+            async function poll() {
+                const res = await fetch(`/api/crawl/${jobId}`);
+                if (!res.ok) {
+                    return;
+                }
+
+                const job = await res.json();
+                if (job.status === "queued" || job.status === "running") {
+                    showProgress(job);
+                    return;
+                }
+
+                clearInterval(pollTimer);
+                progressEl.replaceChildren();
+                if (job.status === "failed") {
+                    showError(`crawl failed: ${job.error}`);
+                } else {
+                    loadReport();
+                }
+            }
+
+            function showProgress(job) {
+                const bar = el("div", "bar");
+                bar.style.width = Math.min(100, (job.pages_crawled / job.max_pages) * 100) + "%";
+                const barWrap = el("div", "bar-wrap");
+                barWrap.append(bar);
+
+                progressEl.replaceChildren(
+                    el("p", "status-text", `crawling ${job.root_url} - ${job.pages_crawled}/${job.max_pages} pages`),
+                    barWrap,
+                    el("p", "status-text", `${job.status}...`)
+                );
+            }
+
+            function showError(message) {
+                progressEl.replaceChildren(el("p", "error", message));
+            }
+
+            async function loadReport(filter = "all") {
+                const res = await fetch(`/api/crawl/${jobId}/report?filter=${filter}`);
+                if (!res.ok) {
+                    showError("couldn't load the report");
+                    return;
+                }
+
+                const report = await res.json();
+                const shown = filters.find(f => f.value === filter).count(report.summary);
+
+                const header = el("div", "report-header");
+                header.append(
+                    el("h2", null, `${shown} broken - ${report.summary.total_redirects} redirects`),
+                    buildFilter(filter)
+                );
+
+                const blocks = Object.entries(report.grouped_broken).map(buildBrokenBlock);
+                reportEl.replaceChildren(
+                    header,
+                    ...(blocks.length ? blocks : [el("p", "empty-state", "nothing broken, nice")])
+                );
+            }
+
+            function buildFilter(current) {
+                const select = el("select", "filter-select");
+                for (const f of filters) {
+                    const option = el("option", null, f.label);
+                    option.value = f.value;
+                    option.selected = f.value === current;
+                    select.append(option);
+                }
+                select.addEventListener("change", (e) => loadReport(e.target.value));
+                return select;
+            }
+
+            function buildBrokenBlock([sourcePage, links]) {
+                const list = el("ul", "broken-list");
+                list.append(...links.map(buildBrokenItem));
+
+                const block = el("div", "broken-block");
+                block.append(el("p", "broken-source", `on ${sourcePage}`), list);
+                return block;
+            }
+
+            function buildBrokenItem(link) {
+                const item = el("li", "broken-item");
+                item.append(
+                    el("span", "status-code", link.status_code ?? link.status),
+                    el("span", "target-url", link.target_url)
+                );
+                if (!link.is_internal) {
+                    item.append(el("span", "external-tag", "external"));
+                }
+                return item;
+            }
+
+            function el(tag, className, text) {
+                const node = document.createElement(tag);
+                if (className) {
+                    node.className = className;
+                }
+                if (text !== undefined) {
+                    node.textContent = text;
+                }
+                return node;
+            }
+        </script>
+    </body>
+</html>

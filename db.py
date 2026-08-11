@@ -5,7 +5,6 @@ db_path = Path(__file__).parent / "crawler.db"
 conn = sqlite3.connect(db_path, check_same_thread=False)
 conn.row_factory = sqlite3.Row
 conn.execute("PRAGMA journal_mode=WAL")
-conn.execute("PRAGMA foreign_keys=ON")
 
 
 def init_db():
@@ -36,32 +35,21 @@ def init_db():
     conn.execute("""
         create table if not exists links (
             id integer primary key autoincrement,
-            job_id text,
-            source_page text,
-            target_url text,
-            is_internal integer,
+            job_id text not null,
+            source_page text not null,
+            target_url text not null,
+            is_internal integer not null,
             status_code integer,
-            status text,
-            redirect_chain text,
+            status text not null,
+            redirect_chain text not null,
             error_message text,
-            checked_at real
+            checked_at real not null
         )
     """)
     conn.execute("create index if not exists idx_links_job on links(job_id)")
     conn.execute("create index if not exists idx_pages_job on pages(job_id)")
     conn.execute("create index if not exists idx_links_status on links(job_id, status)")
     conn.commit()
-
-    row = conn.execute("select count(*) as c from sqlite_master where type='table'").fetchone()
-    print("db ready:", db_path, "tables:", row["c"])
-
-
-def reset_db():
-    conn.execute("drop table if exists jobs")
-    conn.execute("drop table if exists pages")
-    conn.execute("drop table if exists links")
-    conn.commit()
-    init_db()
 
 
 def close_db():
